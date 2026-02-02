@@ -5,6 +5,7 @@ import datetime
 import os
 from get_token import iiko_service
 from dateutil.relativedelta import relativedelta
+import calendar
 
 # --- КОНФИГУРАЦИЯ ПОЛЕЙ OLAP ---
 # Если имена полей на сервере отличаются, поменяйте их здесь
@@ -91,6 +92,69 @@ def fetch_olap_data(date_from, date_to, silent=False):
     except Exception as e:
         if not silent: st.error(f"Ошибка при запросе: {e}")
         return pd.DataFrame()
+
+# --- ФУНКЦИЯ ЗАГРУЗКИ СЕБЕСТОИМОСТИ ---
+def normalize_dish_name(series):
+    return (
+        series.astype(str)
+        .str.replace("\u00A0", " ", regex=False)
+        .str.strip()
+        .str.replace("ё", "е", regex=False)
+        .str.replace(",", ".", regex=False)
+        .str.replace(r"\s+", " ", regex=True)
+        .str.lower()
+    )
+
+def load_tech_map():
+    """Загружает себестоимость из файла cost_map.tsv"""
+    file_path = os.path.join(os.path.dirname(__file__), "cost_map.tsv")
+    if not os.path.exists(file_path):
+        return pd.DataFrame()
+    
+    try:
+        df = pd.read_csv(file_path, sep="\t", header=None, names=["DishName", "Cost"], encoding="utf-8")
+
+        df = df[df["DishName"].notna()].copy()
+        df["DishName"] = df["DishName"].astype(str)
+        df["Cost"] = (
+            df["Cost"]
+            .astype(str)
+            .str.replace("\u00A0", " ", regex=False)
+            .str.replace(" ", "", regex=False)
+            .str.replace(",", ".", regex=False)
+        )
+        df["Cost"] = pd.to_numeric(df["Cost"], errors='coerce')
+        df = df.dropna(subset=["Cost"])
+
+        df["DishNameNormalized"] = normalize_dish_name(df["DishName"])
+
+        # Убираем дубликаты в тех карте, чтобы избежать ошибок
+        df = df.drop_duplicates(subset=["DishNameNormalized"])
+        return df[["DishNameNormalized", "Cost"]]
+    except Exception:
+        return pd.DataFrame()
+
+def apply_costs_to_df(df, df_tech):
+    if df.empty:
+        return df
+    df = df.copy()
+    df[FIELDS["Revenue"]] = pd.to_numeric(df[FIELDS["Revenue"]], errors='coerce').fillna(0)
+    df[FIELDS["Quantity"]] = pd.to_numeric(df[FIELDS["Quantity"]], errors='coerce').fillna(0)
+    if not df_tech.empty:
+        df[FIELDS["DishName"]] = df[FIELDS["DishName"]].astype(str)
+        df["DishNameNormalized"] = normalize_dish_name(df[FIELDS["DishName"]])
+        df = df.merge(
+            df_tech,
+            left_on="DishNameNormalized",
+            right_on="DishNameNormalized",
+            how="left"
+        )
+        df["Cost"] = pd.to_numeric(df["Cost"], errors='coerce').fillna(0)
+    else:
+        df["Cost"] = 0
+    df["TotalCost"] = df["Cost"] * df[FIELDS["Quantity"]]
+    df["GrossProfit"] = df[FIELDS["Revenue"]] - df["TotalCost"]
+    return df
 
 # --- SIDEBAR: НАСТРОЙКИ ПЕРИОДА ---
 st.sidebar.header("Настройка периода")
@@ -220,17 +284,24 @@ with st.spinner("Получение данных из iiko..."):
     df_curr_raw = fetch_olap_data(curr_start_date, curr_end_date)
     df_prev_raw = fetch_olap_data(prev_start_date, prev_end_date)
 
+# Загружаем себестоимость один раз
+df_tech = load_tech_map()
+
 # Разделяем данные на активные и удаленные уже в коде
 # df_curr_raw может быть пустым, нужна проверка
 if not df_curr_raw.empty:
     df_curr = df_curr_raw[df_curr_raw[FIELDS["IsDeleted"]] == 'NOT_DELETED'].copy()
     df_del = df_curr_raw[df_curr_raw[FIELDS["IsDeleted"]] == 'DELETED'].copy()
+    
+    # --- ИНТЕГРАЦИЯ С СЕБЕСТОИМОСТЬЮ ---
+    df_curr = apply_costs_to_df(df_curr, df_tech)
 else:
     df_curr = pd.DataFrame()
     df_del = pd.DataFrame()
 
 if not df_prev_raw.empty:
-    df_prev = df_prev_raw[df_prev_raw[FIELDS["IsDeleted"]] == 'NOT_DELETED']
+    df_prev = df_prev_raw[df_prev_raw[FIELDS["IsDeleted"]] == 'NOT_DELETED'].copy()
+    df_prev = apply_costs_to_df(df_prev, df_tech)
 else:
     df_prev = pd.DataFrame()
 
@@ -372,18 +443,49 @@ st.markdown(f"""
 
 st.divider()
 
+# --- 1.1 ФИНАНСОВЫЙ РЕЗУЛЬТАТ ---
+st.markdown("### 💰 Финансовый результат")
+
+def calc_financials(df):
+    if df.empty:
+        return 0, 0, 0
+    revenue = pd.to_numeric(df[FIELDS["Revenue"]], errors='coerce').fillna(0).sum()
+    cogs = pd.to_numeric(df["TotalCost"], errors='coerce').fillna(0).sum() if "TotalCost" in df.columns else 0
+    gross = revenue - cogs
+    return revenue, cogs, gross
+
+rev_curr, cogs_curr, gross_curr = calc_financials(df_curr)
+rev_prev, cogs_prev, gross_prev = calc_financials(df_prev)
+
+delta_rev = rev_curr - rev_prev
+delta_cogs = cogs_curr - cogs_prev
+delta_gross = gross_curr - gross_prev
+
+col_f1, col_f2, col_f3 = st.columns(3)
+col_f1.metric("Выручка", f"{format_integer(rev_curr)} ₸", delta=f"{format_integer(delta_rev)} ₸")
+col_f2.metric("Себестоимость", f"{format_integer(cogs_curr)} ₸", delta=f"{format_integer(delta_cogs)} ₸")
+col_f3.metric("Валовая прибыль", f"{format_integer(gross_curr)} ₸", delta=f"{format_integer(delta_gross)} ₸")
+
+st.caption(f"Сравнение: выручка {format_integer(rev_prev)} ₸, себестоимость {format_integer(cogs_prev)} ₸, валовая прибыль {format_integer(gross_prev)} ₸.")
+
+st.warning("⚠️ Обратите внимание: Себестоимость считается только по позициям из файла cost_map.tsv. Остальные позиции идут без себестоимости.")
+
 # --- 2. ТАБЛИЦА ПРОДАЖ ---
 st.markdown("### 🍔 Продажи по позициям (Текущий период)")
 if not df_curr.empty:
     sales_table = df_curr.groupby(FIELDS["DishName"]).agg({
         FIELDS["Quantity"]: "sum",
-        FIELDS["Revenue"]: "sum"
+        FIELDS["Revenue"]: "sum",
+        "TotalCost": "sum",
+        "GrossProfit": "sum"
     }).reset_index().sort_values(FIELDS["Revenue"], ascending=False)
     
-    sales_table.columns = ["Позиция", "Кол-во", "Выручка"]
+    sales_table.columns = ["Позиция", "Кол-во", "Выручка", "Себестоимость", "Валовая прибыль"]
     
     # Форматирование колонки "Выручка" для лучшей читаемости
     sales_table["Выручка"] = sales_table["Выручка"].apply(format_currency)
+    sales_table["Себестоимость"] = sales_table["Себестоимость"].apply(format_currency)
+    sales_table["Валовая прибыль"] = sales_table["Валовая прибыль"].apply(format_currency)
 
     st.dataframe(sales_table, use_container_width=True, hide_index=True)
 else:
