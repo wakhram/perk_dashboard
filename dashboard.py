@@ -3,6 +3,7 @@ import pandas as pd
 import plotly.express as px
 import datetime
 import os
+import hashlib
 from get_token import iiko_service
 from dateutil.relativedelta import relativedelta
 import calendar
@@ -27,16 +28,57 @@ st.title("📊 Дашборд продаж")
 # --- АВТОРИЗАЦИЯ ---
 # Получаем пароль из переменных окружения
 APP_PASSWORD = os.getenv("APP_PASSWORD")
+AUTH_QUERY_KEY = "auth"
+
+def make_auth_token(password):
+    salt = os.getenv("APP_AUTH_SALT", "perk_dashboard")
+    token_src = f"{salt}:{password}"
+    return hashlib.sha256(token_src.encode("utf-8")).hexdigest()
+
+def get_auth_token_from_url():
+    try:
+        params = st.query_params()
+        return params.get(AUTH_QUERY_KEY, [None])[0]
+    except Exception:
+        return None
+
+def set_auth_token_in_url(token):
+    try:
+        if token:
+            st.query_params(**{AUTH_QUERY_KEY: token})
+        else:
+            st.query_params()
+    except Exception:
+        pass
 
 if not APP_PASSWORD:
     st.error("⚠️ Ошибка конфигурации: не задан пароль приложения (APP_PASSWORD).")
     st.stop()
 
-password = st.sidebar.text_input("🔒 Введите пароль администратора", type="password")
+if "auth_ok" not in st.session_state:
+    st.session_state["auth_ok"] = False
 
-if password != APP_PASSWORD:
-    st.warning("Пожалуйста, введите верный пароль для доступа к данным.")
-    st.stop()
+expected_token = make_auth_token(APP_PASSWORD)
+url_token = get_auth_token_from_url()
+if url_token == expected_token:
+    st.session_state["auth_ok"] = True
+
+if not st.session_state["auth_ok"]:
+    password = st.sidebar.text_input("🔒 Введите пароль администратора", type="password")
+    remember_password = st.sidebar.checkbox("💾 Запомнить на этом устройстве", value=True)
+
+    if password:
+        if password == APP_PASSWORD:
+            st.session_state["auth_ok"] = True
+            if remember_password:
+                set_auth_token_in_url(expected_token)
+            else:
+                set_auth_token_in_url(None)
+        else:
+            st.warning("Пожалуйста, введите верный пароль для доступа к данным.")
+            st.stop()
+    else:
+        st.stop()
 
 # --- ФУНКЦИЯ ЗАГРУЗКИ ДАННЫХ ---
 @st.cache_data(ttl=300)
@@ -112,7 +154,21 @@ def load_tech_map():
         return pd.DataFrame()
     
     try:
-        df = pd.read_csv(file_path, sep="\t", header=None, names=["DishName", "Cost"], encoding="utf-8")
+        rows = []
+        with open(file_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                if "\t" in line:
+                    parts = line.split("\t", 1)
+                else:
+                    parts = line.rsplit(" ", 1)
+                if len(parts) != 2:
+                    continue
+                rows.append(parts)
+
+        df = pd.DataFrame(rows, columns=["DishName", "Cost"])
 
         df = df[df["DishName"].notna()].copy()
         df["DishName"] = df["DishName"].astype(str)
@@ -128,16 +184,18 @@ def load_tech_map():
 
         df["DishNameNormalized"] = normalize_dish_name(df["DishName"])
 
-        # Убираем дубликаты в тех карте, чтобы избежать ошибок
-        df = df.drop_duplicates(subset=["DishNameNormalized"])
+        # Убираем дубликаты, оставляя последнюю цену (удобно для обновлений)
+        df = df.drop_duplicates(subset=["DishNameNormalized"], keep="last")
         return df[["DishNameNormalized", "Cost"]]
     except Exception:
         return pd.DataFrame()
 
-def apply_costs_to_df(df, df_tech):
+def apply_costs_to_df(df, df_tech=None):
     if df.empty:
         return df
     df = df.copy()
+    if df_tech is None:
+        df_tech = load_tech_map()
     df[FIELDS["Revenue"]] = pd.to_numeric(df[FIELDS["Revenue"]], errors='coerce').fillna(0)
     df[FIELDS["Quantity"]] = pd.to_numeric(df[FIELDS["Quantity"]], errors='coerce').fillna(0)
     if not df_tech.empty:
@@ -284,9 +342,6 @@ with st.spinner("Получение данных из iiko..."):
     df_curr_raw = fetch_olap_data(curr_start_date, curr_end_date)
     df_prev_raw = fetch_olap_data(prev_start_date, prev_end_date)
 
-# Загружаем себестоимость один раз
-df_tech = load_tech_map()
-
 # Разделяем данные на активные и удаленные уже в коде
 # df_curr_raw может быть пустым, нужна проверка
 if not df_curr_raw.empty:
@@ -294,14 +349,14 @@ if not df_curr_raw.empty:
     df_del = df_curr_raw[df_curr_raw[FIELDS["IsDeleted"]] == 'DELETED'].copy()
     
     # --- ИНТЕГРАЦИЯ С СЕБЕСТОИМОСТЬЮ ---
-    df_curr = apply_costs_to_df(df_curr, df_tech)
+    df_curr = apply_costs_to_df(df_curr)
 else:
     df_curr = pd.DataFrame()
     df_del = pd.DataFrame()
 
 if not df_prev_raw.empty:
     df_prev = df_prev_raw[df_prev_raw[FIELDS["IsDeleted"]] == 'NOT_DELETED'].copy()
-    df_prev = apply_costs_to_df(df_prev, df_tech)
+    df_prev = apply_costs_to_df(df_prev)
 else:
     df_prev = pd.DataFrame()
 
@@ -570,9 +625,14 @@ if not h_curr.empty or not h_prev.empty:
                   template="plotly_white") # Базовая светлая тема
 
     # Делаем линии плавными
-    fig.update_traces(line_shape='spline', mode='lines+markers')
+    fig.update_traces(
+        line_shape='spline',
+        mode='lines+markers+text',
+        texttemplate='%{y}',
+        textposition='top center'
+    )
 
-    fig.update_xaxes(tickvals=list(range(0, 24, 2)), gridcolor='rgba(0,0,0,0.1)') 
+    fig.update_xaxes(tickvals=list(range(0, 24, 1)), gridcolor='rgba(0,0,0,0.1)') 
     fig.update_yaxes(gridcolor='rgba(0,0,0,0.1)')
     
     fig.update_layout(
@@ -586,6 +646,44 @@ if not h_curr.empty or not h_prev.empty:
     )
 
     # theme=None отключает перекрашивание графика Streamlit-ом в темную тему
-    st.plotly_chart(fig, use_container_width=True, theme=None)
+    st.plotly_chart(
+        fig,
+        use_container_width=True,
+        theme=None,
+        config={"staticPlot": True, "displayModeBar": False}
+    )
+
+    fig_bar = px.bar(
+        chart_df,
+        x="Hour",
+        y="CheckCount",
+        color="Period",
+        barmode="group",
+        color_discrete_map={"Текущий": "#2ecc71", "Прошлый": "#3498db"},
+        labels={"Hour": "Час", "CheckCount": "Кол-во чеков"},
+        template="plotly_white"
+    )
+
+    fig_bar.update_xaxes(tickvals=list(range(0, 24, 1)), gridcolor='rgba(0,0,0,0.1)')
+    fig_bar.update_yaxes(gridcolor='rgba(0,0,0,0.1)')
+    fig_bar.update_traces(
+        texttemplate='%{y}',
+        textposition='outside'
+    )
+    fig_bar.update_layout(
+        yaxis_title="Количество чеков",
+        paper_bgcolor="white",
+        plot_bgcolor="white",
+        font=dict(color="black"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        margin=dict(l=20, r=20, t=30, b=20)
+    )
+
+    st.plotly_chart(
+        fig_bar,
+        use_container_width=True,
+        theme=None,
+        config={"staticPlot": True, "displayModeBar": False}
+    )
 else:
     st.info("Недостаточно данных для графика.")
