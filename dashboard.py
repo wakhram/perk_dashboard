@@ -219,8 +219,69 @@ st.sidebar.header("Настройка периода")
 
 today = datetime.date.today()
 
-# 1. Выбор текущего периода
+# 1. Быстрый выбор периода
 st.sidebar.subheader("Текущий период")
+period_presets = [
+    "Сегодня",
+    "Текущая неделя",
+    "Текущий месяц",
+    "Текущий год",
+    "Вчера",
+    "Прошлая неделя",
+    "Прошлый месяц",
+    "Прошлый год",
+    "Вручную"
+]
+selected_preset = st.sidebar.selectbox("За период", period_presets, index=0, key="period_preset")
+
+def get_preset_dates(preset: str, ref_date: datetime.date):
+    if preset == "Сегодня":
+        return ref_date, ref_date
+    if preset == "Вчера":
+        d = ref_date - datetime.timedelta(days=1)
+        return d, d
+    if preset == "Текущая неделя":
+        start = ref_date - datetime.timedelta(days=ref_date.weekday())
+        end = start + datetime.timedelta(days=6)
+        return start, end
+    if preset == "Прошлая неделя":
+        end = ref_date - datetime.timedelta(days=ref_date.weekday() + 1)
+        start = end - datetime.timedelta(days=6)
+        return start, end
+    if preset == "Текущий месяц":
+        start = ref_date.replace(day=1)
+        last_day = calendar.monthrange(ref_date.year, ref_date.month)[1]
+        end = ref_date.replace(day=last_day)
+        return start, end
+    if preset == "Прошлый месяц":
+        year = ref_date.year
+        month = ref_date.month - 1
+        if month == 0:
+            month = 12
+            year -= 1
+        start = datetime.date(year, month, 1)
+        last_day = calendar.monthrange(year, month)[1]
+        end = datetime.date(year, month, last_day)
+        return start, end
+    if preset == "Текущий год":
+        start = datetime.date(ref_date.year, 1, 1)
+        end = datetime.date(ref_date.year, 12, 31)
+        return start, end
+    if preset == "Прошлый год":
+        year = ref_date.year - 1
+        start = datetime.date(year, 1, 1)
+        end = datetime.date(year, 12, 31)
+        return start, end
+    return ref_date, ref_date
+
+if selected_preset != "Вручную":
+    preset_start, preset_end = get_preset_dates(selected_preset, today)
+    if st.session_state.get("d1") != preset_start:
+        st.session_state["d1"] = preset_start
+    if st.session_state.get("d2") != preset_end:
+        st.session_state["d2"] = preset_end
+
+# 2. Выбор текущего периода вручную (календарь)
 curr_start_date = st.sidebar.date_input("Начало", today, key="d1")
 curr_end_date = st.sidebar.date_input("Конец", today, key="d2")
 
@@ -528,7 +589,42 @@ st.warning("⚠️ Обратите внимание: Себестоимость
 # --- 2. ТАБЛИЦА ПРОДАЖ ---
 st.markdown("### 🍔 Продажи по позициям (Текущий период)")
 if not df_curr.empty:
-    sales_table = df_curr.groupby(FIELDS["DishName"]).agg({
+    # --- Типы оплаты (нал / безнал / итого) ---
+    pay_source = df_curr.copy()
+    pay_source[FIELDS["Revenue"]] = pd.to_numeric(pay_source[FIELDS["Revenue"]], errors='coerce').fillna(0)
+    pay_source[FIELDS["PayTypes"]] = pay_source[FIELDS["PayTypes"]].fillna("Не указано").astype(str)
+
+    def map_pay_type(value: str) -> str:
+        v = value.strip().lower()
+        if "безнал" in v:
+            return "Безналичными"
+        if "нал" in v:
+            return "Наличными"
+        if "cash" in v:
+            return "Наличными"
+        if "card" in v or "visa" in v or "master" in v:
+            return "Безналичными"
+        return "Безналичными"
+
+    pay_source["PayTypeGroup"] = pay_source[FIELDS["PayTypes"]].apply(map_pay_type)
+    pay_summary = pay_source.groupby("PayTypeGroup")[FIELDS["Revenue"]].sum()
+    cash_sum = float(pay_summary.get("Наличными", 0))
+    noncash_sum = float(pay_summary.get("Безналичными", 0))
+    total_sum = cash_sum + noncash_sum
+
+    col_p1, col_p2, col_p3 = st.columns(3)
+    col_p1.metric("Наличными", f"{format_currency(cash_sum)} ₸")
+    col_p2.metric("Безналичными", f"{format_currency(noncash_sum)} ₸")
+    col_p3.metric("Итого", f"{format_currency(total_sum)} ₸")
+
+    sales_source = df_curr.copy()
+    # Учитываем строки без названия позиции (иначе groupby их отбросит)
+    sales_source[FIELDS["DishName"]] = sales_source[FIELDS["DishName"]].fillna("Без названия")
+    # Исключаем строки с нулевой выручкой (часто это удаленные позиции внутри заказа)
+    sales_source[FIELDS["Revenue"]] = pd.to_numeric(sales_source[FIELDS["Revenue"]], errors='coerce').fillna(0)
+    sales_source = sales_source[sales_source[FIELDS["Revenue"]] != 0]
+
+    sales_table = sales_source.groupby(FIELDS["DishName"]).agg({
         FIELDS["Quantity"]: "sum",
         FIELDS["Revenue"]: "sum",
         "TotalCost": "sum",
@@ -536,8 +632,19 @@ if not df_curr.empty:
     }).reset_index().sort_values(FIELDS["Revenue"], ascending=False)
     
     sales_table.columns = ["Позиция", "Кол-во", "Выручка", "Себестоимость", "Валовая прибыль"]
+
+    # Добавляем строку итогов в начало таблицы
+    totals_row = {
+        "Позиция": "Итого",
+        "Кол-во": sales_table["Кол-во"].sum(),
+        "Выручка": sales_table["Выручка"].sum(),
+        "Себестоимость": sales_table["Себестоимость"].sum(),
+        "Валовая прибыль": sales_table["Валовая прибыль"].sum()
+    }
+    sales_table = pd.concat([pd.DataFrame([totals_row]), sales_table], ignore_index=True)
     
-    # Форматирование колонки "Выручка" для лучшей читаемости
+    # Форматирование колонок для лучшей читаемости
+    sales_table["Кол-во"] = sales_table["Кол-во"].apply(format_integer)
     sales_table["Выручка"] = sales_table["Выручка"].apply(format_currency)
     sales_table["Себестоимость"] = sales_table["Себестоимость"].apply(format_currency)
     sales_table["Валовая прибыль"] = sales_table["Валовая прибыль"].apply(format_currency)
