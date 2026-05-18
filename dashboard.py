@@ -207,9 +207,13 @@ def apply_costs_to_df(df, df_tech=None):
             right_on="DishNameNormalized",
             how="left"
         )
-        df["Cost"] = pd.to_numeric(df["Cost"], errors='coerce').fillna(0)
+        df["Cost"] = pd.to_numeric(df["Cost"], errors='coerce')
+        # Если себестоимость не найдена в cost_map.tsv, используем 50% от продажной цены за единицу.
+        unit_sale_price = (df[FIELDS["Revenue"]] / df[FIELDS["Quantity"]].replace(0, pd.NA)).fillna(0)
+        df["Cost"] = df["Cost"].fillna(unit_sale_price * 0.5)
     else:
-        df["Cost"] = 0
+        unit_sale_price = (df[FIELDS["Revenue"]] / df[FIELDS["Quantity"]].replace(0, pd.NA)).fillna(0)
+        df["Cost"] = unit_sale_price * 0.5
     df["TotalCost"] = df["Cost"] * df[FIELDS["Quantity"]]
     df["GrossProfit"] = df[FIELDS["Revenue"]] - df["TotalCost"]
     return df
@@ -584,7 +588,7 @@ col_f3.metric("Валовая прибыль", f"{format_integer(gross_curr)} �
 
 st.caption(f"Сравнение: выручка {format_integer(rev_prev)} ₸, себестоимость {format_integer(cogs_prev)} ₸, валовая прибыль {format_integer(gross_prev)} ₸.")
 
-st.warning("⚠️ Обратите внимание: Себестоимость считается только по позициям из файла cost_map.tsv. Остальные позиции идут без себестоимости.")
+st.warning("⚠️ Обратите внимание: если позиция не найдена в cost_map.tsv, себестоимость считается как 50% от продажной стоимости позиции.")
 
 # --- 2. ТАБЛИЦА ПРОДАЖ ---
 st.markdown("### 🍔 Продажи по позициям (Текущий период)")
