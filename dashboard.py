@@ -198,9 +198,9 @@ def apply_costs_to_df(df, df_tech=None):
         df_tech = load_tech_map()
     df[FIELDS["Revenue"]] = pd.to_numeric(df[FIELDS["Revenue"]], errors='coerce').fillna(0)
     df[FIELDS["Quantity"]] = pd.to_numeric(df[FIELDS["Quantity"]], errors='coerce').fillna(0)
+    df[FIELDS["DishName"]] = df[FIELDS["DishName"]].astype(str)
+    df["DishNameNormalized"] = normalize_dish_name(df[FIELDS["DishName"]])
     if not df_tech.empty:
-        df[FIELDS["DishName"]] = df[FIELDS["DishName"]].astype(str)
-        df["DishNameNormalized"] = normalize_dish_name(df[FIELDS["DishName"]])
         df = df.merge(
             df_tech,
             left_on="DishNameNormalized",
@@ -214,6 +214,9 @@ def apply_costs_to_df(df, df_tech=None):
     else:
         unit_sale_price = (df[FIELDS["Revenue"]] / df[FIELDS["Quantity"]].replace(0, pd.NA)).fillna(0)
         df["Cost"] = unit_sale_price * 0.5
+    # Исключение: для Берлинера и Синнабона себестоимость = 100% выручки.
+    full_cost_mask = df["DishNameNormalized"].str.contains("берлинер|синнабон", na=False)
+    df.loc[full_cost_mask, "Cost"] = unit_sale_price[full_cost_mask]
     df["TotalCost"] = df["Cost"] * df[FIELDS["Quantity"]]
     df["GrossProfit"] = df[FIELDS["Revenue"]] - df["TotalCost"]
     return df
@@ -588,7 +591,7 @@ col_f3.metric("Валовая прибыль", f"{format_integer(gross_curr)} �
 
 st.caption(f"Сравнение: выручка {format_integer(rev_prev)} ₸, себестоимость {format_integer(cogs_prev)} ₸, валовая прибыль {format_integer(gross_prev)} ₸.")
 
-st.warning("⚠️ Обратите внимание: если позиция не найдена в cost_map.tsv, себестоимость считается как 50% от продажной стоимости позиции.")
+st.warning("⚠️ Обратите внимание: если позиция не найдена в cost_map.tsv, себестоимость считается как 50% от продажной стоимости позиции. Для позиций с названиями 'Берлинер' и 'Синнабон' себестоимость считается как 100% от продажной стоимости.")
 
 # --- 2. ТАБЛИЦА ПРОДАЖ ---
 st.markdown("### 🍔 Продажи по позициям (Текущий период)")
